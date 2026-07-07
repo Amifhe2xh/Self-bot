@@ -8,220 +8,357 @@ import pytz
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
-API_ID        = int(os.environ.get("API_ID", 0))
-API_HASH      = os.environ.get("API_HASH", "")
-SESSION_STR   = os.environ.get("SESSION_STRING", "")
-BOT_TOKEN     = os.environ.get("BOT_TOKEN", "")
-TIMEZONE      = os.environ.get("TIMEZONE", "Asia/Tehran")
-TIME_FORMAT   = os.environ.get("TIME_FORMAT", "%H:%M")
-UPDATE_EVERY  = int(os.environ.get("UPDATE_INTERVAL", "60"))
-BASE_NAME     = os.environ.get("BASE_NAME", "")
-SEPARATOR     = os.environ.get("SEPARATOR", " ǀ ")
-OWNER_ID      = int(os.environ.get("OWNER_ID", "0"))
+# ─── متغیرها ────────────────────────────────────────────
+
+API_ID      = int(os.environ.get("API_ID", 0))
+API_HASH    = os.environ.get("API_HASH", "")
+SESSION_STR = os.environ.get("SESSION_STRING", "")
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
+TIMEZONE    = os.environ.get("TIMEZONE", "Asia/Tehran")
+TIME_FORMAT = os.environ.get("TIME_FORMAT", "%H:%M")
+UPDATE_EVERY = int(os.environ.get("UPDATE_INTERVAL", "60"))
+BASE_NAME   = os.environ.get("BASE_NAME", "")
+SEPARATOR   = os.environ.get("SEPARATOR", " ǀ ")
+
+# ─── لاگینگ ─────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("selfbot")
+log = logging.getLogger("bot")
 
-setup_sessions = {}
+# ─── وضعیت کاربران در حال ستاپ ─────────────────────────
 
+users = {}  # {user_id: {"step": str, "phone": str, ...}}
+
+
+# ══════════════════════════════════════════════════════════
+#  حالت ستاپ — ساخت Session String
+# ══════════════════════════════════════════════════════════
 
 async def run_setup_bot():
-    log.info("حالت ستاپ فعال شد")
-    bot = TelegramClient("setup_bot", API_ID, API_HASH)
+
+    log.info(">>> حالت ستاپ شروع شد")
+
+    bot = TelegramClient("setup_session", API_ID, API_HASH)
     await bot.start(bot_token=BOT_TOKEN)
 
     me = await bot.get_me()
-    log.info(f"ربات ستاپ: @{me.username}")
+    log.info(f">>> ربات فعال: @{me.username}")
 
-    @bot.on(events.NewMessage(pattern=r"/start"))
-    async def start_handler(event):
-        global OWNER_ID
-        uid = event.sender_id
-        if OWNER_ID == 0:
-            OWNER_ID = uid
-        if uid != OWNER_ID:
-            await event.respond("⛔ فقط مالک ربات.")
-            return
-        setup_sessions[uid] = {"step": "phone", "phone": ""}
-        await event.respond(
-            "🔧 **ساخت Session String**\n\n"
-            "شماره تلفنت رو بفرست:\n"
-            "مثال: `+989123456789`"
-        )
+    owner_id = [0]  # لیست برای دسترسی داخل closure
 
-    @bot.on(events.NewMessage(func=lambda e: e.sender_id == OWNER_ID))
-    async def msg_handler(event):
-        uid = event.sender_id
-        if uid not in setup_sessions:
+    # ── هندلر اصلی: همه پیام‌ها ─────────────────────────
+
+    @bot.on(events.NewMessage)
+    async def handle_all(event):
+
+        # فقط پیام‌های خصوصی
+        if not event.is_private:
             return
-        s = setup_sessions[uid]
+
+        uid = event.sender_id
         text = event.text.strip()
 
-        if s["step"] == "phone":
-            if not text.startswith("+") or len(text) < 10:
-                await event.respond("❌ فرمت اشتباه. مثال: `+989123456789`")
-                return
-            s["phone"] = text
-            s["step"] = "code"
-            s["client"] = TelegramClient(StringSession(), API_ID, API_HASH)
-            await s["client"].connect()
-            try:
-                sent = await s["client"].send_code_request(text)
-                s["hash"] = sent.phone_code_hash
-                await event.respond("📨 کد تایید رو بفرست:")
-            except Exception as e:
-                s["step"] = "phone"
-                await event.respond(f"❌ خطا: `{e}`\nدوباره شماره بفرست.")
+        # ── /start ──────────────────────────────────────
+        if text == "/start":
 
-        elif s["step"] == "code":
-            code = text.replace(" ", "")
+            # اولین نفر = مالک
+            if owner_id[0] == 0:
+                owner_id[0] = uid
+                log.info(f">>> مالک شناسایی شد: {uid}")
+
+            # فقط مالک
+            if uid != owner_id[0]:
+                await event.respond("⛔ این ربات مال تو نیست.")
+                return
+
+            users[uid] = {"step": "wait_phone"}
+
+            await event.respond(
+                "━━━ 🔧 ساخت Session String ━━━\n\n"
+                "شماره تلفنت رو بفرست:\n"
+                "مثال: `+989123456789`"
+            )
+            return
+
+        # ── دستورات دیگه رو نادیده بگیر ────────────────
+        if text.startswith("/"):
+            return
+
+        # ── فقط مالک ───────────────────────────────────
+        if uid != owner_id[0]:
+            return
+
+        # ── اگه کاربر توی پروسه ستاپ نیست ─────────────
+        if uid not in users:
+            return
+
+        step = users[uid]["step"]
+
+        # ═══ مرحله: دریافت شماره ═══════════════════════
+        if step == "wait_phone":
+
+            if not text.startswith("+") or len(text) < 10:
+                await event.respond(
+                    "❌ فرمت اشتباه.\n"
+                    "مثال: `+989123456789`"
+                )
+                return
+
+            phone = text
+            users[uid]["phone"] = phone
+            users[uid]["step"] = "wait_code"
+
+            # ساخت کلاینت موقت
+            temp = TelegramClient(StringSession(), API_ID, API_HASH)
+            await temp.connect()
+            users[uid]["temp"] = temp
+
+            try:
+                result = await temp.send_code_request(phone)
+                users[uid]["hash"] = result.phone_code_hash
+                log.info(f">>> کد ارسال شد به {phone}")
+                await event.respond(
+                    "📨 کد تایید به تلگرامت ارسال شد.\n\n"
+                    "کد رو بفرست:"
+                )
+            except Exception as e:
+                log.error(f">>> خطا ارسال کد: {e}")
+                users[uid]["step"] = "wait_phone"
+                await temp.disconnect()
+                await event.respond(
+                    f"❌ خطا: `{e}`\n\n"
+                    "دوباره شماره رو بفرست:"
+                )
+            return
+
+        # ═══ مرحله: دریافت کد ══════════════════════════
+        if step == "wait_code":
+
+            code = text.replace(" ", "").replace("-", "")
             if not code.isdigit():
                 await event.respond("❌ کد باید عددی باشه.")
                 return
+
+            temp = users[uid]["temp"]
+            phone = users[uid]["phone"]
+            phone_hash = users[uid]["hash"]
+
             try:
-                await s["client"].sign_in(
-                    phone=s["phone"],
+                await temp.sign_in(
+                    phone=phone,
                     code=code,
-                    phone_code_hash=s["hash"]
+                    phone_code_hash=phone_hash
                 )
+                log.info(">>> ورود موفق!")
+
             except Exception as e:
-                if "password" in str(e).lower():
-                    s["step"] = "2fa"
-                    await event.respond("🔒 رمز دو مرحله‌ای رو بفرست:")
+                err = str(e).lower()
+                log.error(f">>> خطا ورود: {e}")
+
+                # نیاز به رمز دو مرحله‌ای
+                if "password" in err or "2fa" in err:
+                    users[uid]["step"] = "wait_2fa"
+                    await event.respond(
+                        "🔒 رمز دو مرحله‌ای فعاله.\n"
+                        "رمز رو بفرست:"
+                    )
                     return
-                s["step"] = "phone"
-                await event.respond(f"❌ خطا: `{e}`\n/start رو بزن.")
+
+                users[uid]["step"] = "wait_phone"
+                await temp.disconnect()
+                del users[uid]["temp"]
+                await event.respond(
+                    f"❌ خطا: `{e}`\n\n"
+                    "/start رو بزن از اول."
+                )
                 return
 
-            ss = s["client"].session.save()
-            await s["client"].disconnect()
+            # ساخت session string
+            ss = temp.session.save()
+            await temp.disconnect()
+
             await event.respond(
-                "✅ **سشن ساخته شد!**\n\n"
+                "━━━ ✅ سشن ساخته شد! ━━━\n\n"
+                "این رشته رو کپی کن:\n\n"
                 f"`{ss}`\n\n"
-                "1. Railway → Variables\n"
-                "2. `SESSION_STRING` = اون رشته\n"
-                "3. ری‌دیپلوی کن 🚀"
+                "━━━ مراحل بعدی ━━━\n\n"
+                "1. برو Railway → Variables\n"
+                "2. بساز: `SESSION_STRING`\n"
+                "3. مقدار: اون رشته‌ای که کپی کردی\n"
+                "4. ری‌دیپلوی کن 🚀"
             )
-            del setup_sessions[uid]
 
-        elif s["step"] == "2fa":
+            log.info(">>> Session String ساخته شد!")
+            del users[uid]
+            return
+
+        # ═══ مرحله: رمز دو مرحله‌ای ════════════════════
+        if step == "wait_2fa":
+
+            temp = users[uid]["temp"]
+
             try:
-                await s["client"].sign_in(password=text)
-                ss = s["client"].session.save()
-                await s["client"].disconnect()
-                await event.respond(
-                    "✅ **سشن ساخته شد!**\n\n"
-                    f"`{ss}`\n\n"
-                    "1. Railway → Variables\n"
-                    "2. `SESSION_STRING` = اون رشته\n"
-                    "3. ری‌دیپلوی کن 🚀"
-                )
-                del setup_sessions[uid]
-            except Exception as e:
-                await event.respond(f"❌ رمز اشتباه: `{e}`")
+                await temp.sign_in(password=text)
+                ss = temp.session.save()
+                await temp.disconnect()
 
+                await event.respond(
+                    "━━━ ✅ سشن ساخته شد! ━━━\n\n"
+                    "این رشته رو کپی کن:\n\n"
+                    f"`{ss}`\n\n"
+                    "━━━ مراحل بعدی ━━━\n\n"
+                    "1. برو Railway → Variables\n"
+                    "2. بساز: `SESSION_STRING`\n"
+                    "3. مقدار: اون رشته‌ای که کپی کردی\n"
+                    "4. ری‌دیپلوی کن 🚀"
+                )
+
+                log.info(">>> Session String ساخته شد!")
+                del users[uid]
+
+            except Exception as e:
+                log.error(f">>> خطا 2FA: {e}")
+                await event.respond(
+                    f"❌ رمز اشتباه: `{e}`\n\n"
+                    "دوباره رمز رو بفرست:"
+                )
+            return
+
+    # ── نگه‌داشتن ربات ─────────────────────────────────
+    log.info(">>> ربات ستاپ آماده‌ست! منتظر /start ...")
     await bot.run_until_disconnected()
 
 
-original_first_name = ""
-original_last_name  = ""
-original_about      = ""
+# ══════════════════════════════════════════════════════════
+#  حالت سلف‌بات — آپدیت ساعت در اسم
+# ══════════════════════════════════════════════════════════
+
+saved_first = ""
+saved_last  = ""
+saved_about = ""
 
 
-def get_time_string():
+def time_now():
     return datetime.now(pytz.timezone(TIMEZONE)).strftime(TIME_FORMAT)
 
 
-async def update_name(client):
-    global original_first_name, original_last_name, original_about
-    try:
-        from telethon.tl.functions.account import UpdateProfileRequest
-        base = BASE_NAME if BASE_NAME else original_first_name
-        name = f"{base}{SEPARATOR}{get_time_string()}"
-        await client(UpdateProfileRequest(
-            first_name=name,
-            last_name=original_last_name,
-            about=original_about,
-        ))
-        log.info(f"اسم آپدیت شد: {name}")
-    except Exception as e:
-        log.error(f"خطا: {e}")
-
-
-async def restore_name(client):
-    global original_first_name, original_last_name, original_about
-    try:
-        from telethon.tl.functions.account import UpdateProfileRequest
-        await client(UpdateProfileRequest(
-            first_name=original_first_name,
-            last_name=original_last_name,
-            about=original_about,
-        ))
-    except Exception as e:
-        log.error(f"خطا: {e}")
-
-
 async def run_selfbot():
-    global original_first_name, original_last_name, original_about
 
-    log.info("سلف‌بات فعال شد!")
+    global saved_first, saved_last, saved_about
+
+    log.info(">>> حالت سلف‌بات شروع شد")
+
+    from telethon.tl.functions.account import UpdateProfileRequest
+    from telethon.tl.functions.users import GetFullUserRequest
+
     client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
     await client.start()
 
     me = await client.get_me()
-    original_first_name = me.first_name or ""
-    original_last_name  = me.last_name or ""
+    saved_first = me.first_name or ""
+    saved_last  = me.last_name or ""
 
-    from telethon.tl.functions.users import GetFullUserRequest
     full = await client(GetFullUserRequest(me))
-    original_about = full.full_user.about or ""
+    saved_about = full.full_user.about or ""
 
-    log.info(f"لاگین: {me.first_name}")
+    log.info(f">>> لاگین: {saved_first} (@{me.username})")
 
-    @client.on(events.NewMessage(from_users="me", pattern=r"\.status"))
-    async def on_status(event):
-        now = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y/%m/%d %H:%M:%S")
-        await event.respond(
-            f"⏰ تایم‌زون: {TIMEZONE}\n"
-            f"⏰ فرمت: {TIME_FORMAT}\n"
-            f"⏰ هر {UPDATE_EVERY} ثانیه\n"
-            f"⏰ الان: {now}"
-        )
+    # ── آپدیت اسم ──────────────────────────────────────
 
-    @client.on(events.NewMessage(from_users="me", pattern=r"\.stop"))
-    async def on_stop(event):
-        await restore_name(client)
-        await event.respond("⛔ متوقف شد.")
+    async def do_update():
+        base = BASE_NAME if BASE_NAME else saved_first
+        name = f"{base}{SEPARATOR}{time_now()}"
+        await client(UpdateProfileRequest(
+            first_name=name,
+            last_name=saved_last,
+            about=saved_about,
+        ))
+        log.info(f">>> اسم: {name}")
 
-    @client.on(events.NewMessage(from_users="me", pattern=r"\.setname (.+)"))
-    async def on_setname(event):
+    # ── دستورات ────────────────────────────────────────
+
+    @client.on(events.NewMessage(from_users="me"))
+    async def commands(event):
+
         global BASE_NAME
-        BASE_NAME = event.pattern_match.group(1).strip()
-        await event.respond(f"اسم پایه: {BASE_NAME}")
+        text = event.text.strip()
+
+        if text == ".status":
+            tz = pytz.timezone(TIMEZONE)
+            now = datetime.now(tz).strftime("%Y/%m/%d %H:%M:%S")
+            base = BASE_NAME if BASE_NAME else saved_first
+            await event.respond(
+                f"━━━ وضعیت ━━━\n"
+                f"تایم‌زون: {TIMEZONE}\n"
+                f"فرمت: {TIME_FORMAT}\n"
+                f"بازه: هر {UPDATE_EVERY} ثانیه\n"
+                f"ساعت: {now}\n"
+                f"اسم پایه: {base}\n"
+                f"━━━━━━━━━━━━"
+            )
+
+        elif text == ".stop":
+            await client(UpdateProfileRequest(
+                first_name=saved_first,
+                last_name=saved_last,
+                about=saved_about,
+            ))
+            await event.respond("⛔ متوقف شد. اسم اصلی برگردانده شد.")
+
+        elif text.startswith(".setname "):
+            BASE_NAME = text[9:].strip()
+            await event.respond(f"اسم پایه: {BASE_NAME}")
+            await do_update()
+
+    # ── لوپ آپدیت ──────────────────────────────────────
+
+    log.info(f">>> آپدیت هر {UPDATE_EVERY} ثانیه")
 
     while True:
         try:
-            await update_name(client)
+            await do_update()
         except Exception as e:
-            log.error(f"خطا: {e}")
+            log.error(f">>> خطا آپدیت: {e}")
         await asyncio.sleep(UPDATE_EVERY)
 
 
+# ══════════════════════════════════════════════════════════
+#  نقطه ورود
+# ══════════════════════════════════════════════════════════
+
 def main():
-    if not API_ID or not API_HASH:
-        log.error("API_ID و API_HASH لازمه!")
+
+    # بررسی اولیه
+    if not API_ID:
+        log.error("❌ API_ID تنظیم نشده!")
+        sys.exit(1)
+    if not API_HASH:
+        log.error("❌ API_HASH تنظیم نشده!")
         sys.exit(1)
 
+    log.info(f">>> API_ID: {API_ID}")
+    log.info(f">>> API_HASH: {API_HASH[:6]}...")
+    log.info(f">>> SESSION_STRING: {'داره' if SESSION_STR else 'نداره'}")
+    log.info(f">>> BOT_TOKEN: {'داره' if BOT_TOKEN else 'نداره'}")
+
     if SESSION_STR:
+        log.info(">>> میرم حالت سلف‌بات")
         asyncio.run(run_selfbot())
+
     elif BOT_TOKEN:
+        log.info(">>> میرم حالت ستاپ")
         asyncio.run(run_setup_bot())
+
     else:
-        log.error("SESSION_STRING یا BOT_TOKEN لازمه!")
+        log.error(
+            "❌ یکی از اینا لازمه:\n"
+            "   SESSION_STRING (برای سلف‌بات)\n"
+            "   BOT_TOKEN (برای ساخت سشن)"
+        )
         sys.exit(1)
 
 
